@@ -9,6 +9,8 @@
 
 ClickRec_60: A smart near-infrared mouse recording app designed for capturing videos at predefined durations—part of the ClickMouseStudio project.
 
+<img src="imgs\logo.png" alt="Logo" width="400">
+
 ClickRec_60 は、近赤外線撮影に対応したマウスの録画アプリです。ClickMouseStudioプロジェクトの一環として開発されました。
 
 ## 特長
