@@ -33,6 +33,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import numpy as np
 from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageTk
@@ -74,6 +75,70 @@ def get_windows_scaling():
         return 2  # 常に等倍
     except Exception:
         return 2
+
+
+def vascular_enhance_filter(
+    image: np.ndarray,
+    clahe_clip: float = 2.0,
+    a_boost: float = 1.2,
+    b_boost: float = 1.1,
+    l_smooth_ksize: int = 5,
+    multiscale_weight: float = 0.5
+) -> np.ndarray:
+    """
+    マウスの耳などの赤黒い血管構造を自然に目立たせるフィルター。
+    Lab色空間で明度を平滑化＋CLAHE補正し、aチャネル（赤緑）とbチャネル（黄青）を強調。
+    さらにYCrCb・HSV空間のマスクと組み合わせて、赤くて暗い血管領域の検出精度を高める。
+
+    :param image: 入力画像 (numpy.ndarray)
+    :param clahe_clip: CLAHEのコントラスト制限（通常2.0〜4.0）
+    :param a_boost: aチャネル（赤緑成分）の強調係数（>1で赤み増加）
+    :param b_boost: bチャネル（黄青成分）の強調係数（>1で黄み増加）
+    :param l_smooth_ksize: Lチャネルに適用する平滑化（ブラー）カーネルサイズ（奇数）
+    :param multiscale_weight: マルチスケールで加算する強調画像の重み（0.0〜1.0）
+    :return: フィルター処理後のBGR画像 (numpy.ndarray)
+    """
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2Lab)
+    L, A, B = cv2.split(lab)
+
+    # 平滑化 + CLAHE（マルチスケール）
+    L_blur = cv2.GaussianBlur(L, (l_smooth_ksize, l_smooth_ksize), 0)
+    clahe_small = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
+    L_eq = clahe_small.apply(L_blur)
+    clahe_large = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(16, 16))
+    L_large = clahe_large.apply(L)
+    L_combined = np.clip((1.0 - multiscale_weight) * L_eq + multiscale_weight * L_large, 0, 255).astype(np.uint8)
+
+    # Lab補正
+    A_float = A.astype(np.float32)
+    B_float = B.astype(np.float32)
+    A_boosted = (A_float - 128) * a_boost + 128
+    B_boosted = (B_float - 128) * b_boost + 128
+
+    # 血管マスク（Lab）
+    vessel_mask_lab = (A_boosted > 135) & (L_eq < 120)
+
+    # 血管マスク（YCrCb）
+    ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+    _, Cr, _ = cv2.split(ycrcb)
+    vessel_mask_cr = Cr > 145
+
+    # 血管マスク（HSV）
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    H, S, _ = cv2.split(hsv)
+    vessel_mask_hsv = ((H < 10) | (H > 170)) & (S > 70)
+
+    # 複合血管マスク
+    vessel_mask = vessel_mask_lab | vessel_mask_cr | vessel_mask_hsv
+    A_boosted[vessel_mask] = np.clip((A_boosted[vessel_mask] - 128) * 1.3 + 128, 0, 255)
+
+    # 合成と出力
+    A_result = np.clip(A_boosted, 0, 255).astype(np.uint8)
+    B_result = np.clip(B_boosted, 0, 255).astype(np.uint8)
+    lab_boosted = cv2.merge([L_combined, A_result, B_result])
+    result = cv2.cvtColor(lab_boosted, cv2.COLOR_Lab2BGR)
+
+    return result
 
 
 class RecorderApp(tk.Tk):
@@ -335,6 +400,8 @@ class RecorderApp(tk.Tk):
         self.writer = None
         self.latest_frame = None
         self.gray_mode = tk.BooleanVar(value=False)  # グレースケールモードのトグル
+        self.filter = tk.BooleanVar(value=False)  # フィルターのトグル
+
         # 先に None で初期化（UI構築前）
         self.start_btn = None
         self.preview_btn = None
@@ -462,6 +529,17 @@ class RecorderApp(tk.Tk):
             gray_frame,
             text="グレースケールで録画",
             variable=self.gray_mode,
+            onvalue=True,
+            offvalue=False
+        ).pack(side=tk.LEFT)
+
+        # トグルボタンの追加（UI左パネルの末尾に配置するのが良い）
+        filter_frame = ttk.Frame(frame)
+        filter_frame.grid(column=0, row=13, columnspan=3, sticky=tk.W, pady=(5, 0))
+        ttk.Checkbutton(
+            filter_frame,
+            text="フィルター適用で録画",
+            variable=self.filter,
             onvalue=True,
             offvalue=False
         ).pack(side=tk.LEFT)
@@ -597,6 +675,9 @@ class RecorderApp(tk.Tk):
             if frame is None:
                 break
 
+            if self.filter.get():
+                frame = vascular_enhance_filter(frame)
+
             if self.gray_mode.get():
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 frame = cv2.merge([gray, gray, gray])
@@ -706,6 +787,9 @@ class RecorderApp(tk.Tk):
             frame = self.stream.read()
             if frame is None:
                 break
+
+            if self.filter.get():
+                frame = vascular_enhance_filter(frame)
 
             if self.gray_mode.get():
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
