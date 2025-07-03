@@ -87,7 +87,10 @@ print(f"Vendor: {dev.vendorName()}")
 print(f"Name: {dev.name()}")
 print(f"Is Intel? {dev.isIntel()}")
 
-def filters(image, vascular=False, gray=False):
+def filters(image, vascular=False, gray=False, clahe_color=False, clahe_l=False):
+
+    grid_size = (3, 3)
+
 
     # 入力を UMat 化
     image = cv2.UMat(image)
@@ -97,6 +100,43 @@ def filters(image, vascular=False, gray=False):
         return cv2.merge([gray, gray, gray])
     
 
+    def simple_CLAHE_RGB(src_bgr_umat: cv2.UMat, clip: float = 2.0,
+                    grid_size: tuple[int, int] = grid_size) -> cv2.UMat:
+        """
+        入力  : BGR UMat (uint8/uint16)
+        出力  : BGR UMat（各チャンネル独立 CLAHE）
+        """
+        # --- 3 チャンネルを分割（B, G, R の順に来る点に注意） ---
+        b_chan, g_chan, r_chan = cv2.split(src_bgr_umat)   # すべて UMat
+
+        # --- CLAHE オブジェクトは 3 ch で共有して OK ---
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=grid_size)
+
+        b_eq = clahe.apply(b_chan)
+        g_eq = clahe.apply(g_chan)
+        r_eq = clahe.apply(r_chan)
+
+        # --- 結合して BGR で返す ---
+        dst_bgr_umat = cv2.merge((b_eq, g_eq, r_eq))
+        return dst_bgr_umat
+
+
+    def simple_CLAHE_L(src_bgr_umat: cv2.UMat, clip: float = 2.0, grid_size: tuple[int, int] = grid_size) -> cv2.UMat:
+        """
+        BGR→LAB→L にだけ CLAHE→BGR で返す。
+        すべて UMat で処理するので GPU⇄CPU を往復しない。
+        """
+        lab = cv2.cvtColor(src_bgr_umat, cv2.COLOR_BGR2LAB)  # UMat
+        l, a, b = cv2.split(lab)                             # 各チャネルも UMat
+
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=grid_size)
+        l_eq = clahe.apply(l)                                # UMat
+
+        lab_eq = cv2.merge((l_eq, a, b))                     # UMat
+        dst_bgr = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2BGR)    # UMat
+        return dst_bgr
+
+
     def vascular_enhance_filter_ocl(
         src: cv2.UMat,
         clahe_clip: float = 2.0,
@@ -105,6 +145,7 @@ def filters(image, vascular=False, gray=False):
         l_smooth_ksize: int = 5,
         multiscale_weight: float = 0.5,
         vessel_extra_boost: float = 1.3,
+        grid_size: tuple[int, int] = grid_size,
     ) -> cv2.UMat:
         """GPU(OpenCL) で高速に血管を強調するフィルター。
 
@@ -119,11 +160,11 @@ def filters(image, vascular=False, gray=False):
         L_blur = cv2.GaussianBlur(L, (l_smooth_ksize, l_smooth_ksize), 0)
 
         # 小さいタイル
-        clahe_small = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
+        clahe_small = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=grid_size)
         L_eq = clahe_small.apply(L_blur)
 
         # 大きいタイル
-        clahe_large = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(16, 16))
+        clahe_large = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=tuple(s * 2 for s in grid_size))
         L_large = clahe_large.apply(L)
 
         # 重み付き合成 (addWeighted は UMat 対応)
@@ -187,6 +228,12 @@ def filters(image, vascular=False, gray=False):
 
     if vascular:
         image = vascular_enhance_filter_ocl(image)
+
+    if clahe_color:
+        image = simple_CLAHE_RGB(image)
+
+    if clahe_l:
+        image = simple_CLAHE_L(image)
 
     if gray:
         image = gray_filter(image)
@@ -457,6 +504,9 @@ class RecorderApp(tk.Tk):
         self.latest_frame = None
         self.gray_mode = tk.BooleanVar(value=False)  # グレースケールモードのトグル
         self.filter = tk.BooleanVar(value=False)  # フィルターのトグル
+        self.clahe_color = tk.BooleanVar(value=False)  # CLAHEのトグル
+        self.clahe_l = tk.BooleanVar(value=False)  # CLAHEのトグル
+
 
         # 先に None で初期化（UI構築前）
         self.start_btn = None
@@ -594,8 +644,30 @@ class RecorderApp(tk.Tk):
         filter_frame.grid(column=0, row=13, columnspan=3, sticky=tk.W, pady=(5, 0))
         ttk.Checkbutton(
             filter_frame,
-            text="フィルター適用で録画",
+            text="マウス耳介血管強調フィルター（試作）適用で録画",
             variable=self.filter,
+            onvalue=True,
+            offvalue=False
+        ).pack(side=tk.LEFT)
+
+        # トグルボタンの追加（UI左パネルの末尾に配置するのが良い）
+        clahe_color_frame = ttk.Frame(frame)
+        clahe_color_frame.grid(column=0, row=14, columnspan=3, sticky=tk.W, pady=(5, 0))
+        ttk.Checkbutton(
+            clahe_color_frame,
+            text="カラーCLAHE平滑フィルター適用で録画",
+            variable=self.clahe_color,
+            onvalue=True,
+            offvalue=False
+        ).pack(side=tk.LEFT)
+
+        # トグルボタンの追加（UI左パネルの末尾に配置するのが良い）
+        clahe_light_frame = ttk.Frame(frame)
+        clahe_light_frame.grid(column=0, row=15, columnspan=3, sticky=tk.W, pady=(5, 0))
+        ttk.Checkbutton(
+            clahe_light_frame,
+            text="明るさCLAHE平滑フィルター適用で録画",
+            variable=self.clahe_l,
             onvalue=True,
             offvalue=False
         ).pack(side=tk.LEFT)
@@ -732,7 +804,7 @@ class RecorderApp(tk.Tk):
                 break
 
 
-            frame = filters(frame,vascular=self.filter.get(),gray=self.gray_mode.get())
+            frame = filters(frame,vascular=self.filter.get(),gray=self.gray_mode.get(), clahe_color=self.clahe_color.get(),clahe_l=self.clahe_l.get())
 
             # if self.filter.get():
             #     frame = vascular_enhance_filter_ocl(frame)
@@ -847,7 +919,7 @@ class RecorderApp(tk.Tk):
             if frame is None:
                 break
 
-            frame = filters(frame,vascular=self.filter.get(),gray=self.gray_mode.get())
+            frame = filters(frame,vascular=self.filter.get(),gray=self.gray_mode.get(), clahe_color=self.clahe_color.get(),clahe_l=self.clahe_l.get())
 
 
             # if self.filter.get():
