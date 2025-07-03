@@ -16,6 +16,10 @@ DirectShow バックエンドを用いた録画アプリ (GUI、MP4対応、品�
 """
 
 import sys
+import os
+
+
+os.environ["OPENCV_OPENCL_DEVICE"] = ":igpu"
 
 import cv2
 from colorama import Fore, Style, init
@@ -23,7 +27,6 @@ from colorama import Fore, Style, init
 init()
 import ctypes
 import datetime
-import os
 import pathlib
 import re
 import shutil
@@ -75,70 +78,123 @@ def get_windows_scaling():
         return 2  # 常に等倍
     except Exception:
         return 2
+    
+
+cv2.ocl.setUseOpenCL(True)
+
+dev = cv2.ocl.Device_getDefault()
+print(f"Vendor: {dev.vendorName()}")
+print(f"Name: {dev.name()}")
+print(f"Is Intel? {dev.isIntel()}")
+
+def filters(image, vascular=False, gray=False):
+
+    # 入力を UMat 化
+    image = cv2.UMat(image)
+
+    def gray_filter(src) -> cv2.UMat:
+        gray = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
+        return cv2.merge([gray, gray, gray])
+    
+
+    def vascular_enhance_filter_ocl(
+        src: cv2.UMat,
+        clahe_clip: float = 2.0,
+        a_boost: float = 1.2,
+        b_boost: float = 1.1,
+        l_smooth_ksize: int = 5,
+        multiscale_weight: float = 0.5,
+        vessel_extra_boost: float = 1.3,
+    ) -> cv2.UMat:
+        """GPU(OpenCL) で高速に血管を強調するフィルター。
+
+        OpenCV の UMat を用いて主要処理を GPU(OpenCL) にオフロードします。
+        OpenCL が有効でない環境では自動で CPU パスにフォールバックします。
+        """
+        # --- Lab 変換 & 分離 ----------------------------------------------------
+        lab = cv2.cvtColor(src, cv2.COLOR_BGR2Lab)
+        L, A, B = cv2.split(lab)
+
+        # --- L チャネル: 平滑化 + CLAHE(マルチスケール) ------------------------
+        L_blur = cv2.GaussianBlur(L, (l_smooth_ksize, l_smooth_ksize), 0)
+
+        # 小さいタイル
+        clahe_small = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
+        L_eq = clahe_small.apply(L_blur)
+
+        # 大きいタイル
+        clahe_large = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(16, 16))
+        L_large = clahe_large.apply(L)
+
+        # 重み付き合成 (addWeighted は UMat 対応)
+        L_combined = cv2.addWeighted(
+            L_eq, 1.0 - multiscale_weight, L_large, multiscale_weight, 0.0
+        )
+
+        # --- A/B チャネル強調 ---------------------------------------------------
+        # new = gain * (src - 128) + 128  →  new = gain * src + 128*(1-gain)
+        A_boosted = cv2.addWeighted(A, a_boost, A, 0, 128.0 * (1.0 - a_boost))
+        B_boosted = cv2.addWeighted(B, b_boost, B, 0, 128.0 * (1.0 - b_boost))
+
+        # --- 血管マスク生成 -----------------------------------------------------
+        # Lab マスク: (A_boosted > 135) & (L_eq < 120)
+        mask_a = cv2.compare(A_boosted, 135, cv2.CMP_GT)
+        mask_l = cv2.compare(L_eq, 120, cv2.CMP_LT)
+        vessel_mask_lab = cv2.bitwise_and(mask_a, mask_l)
+
+        # YCrCb マスク: Cr > 145
+        ycrcb = cv2.cvtColor(src, cv2.COLOR_BGR2YCrCb)
+        _, Cr, _ = cv2.split(ycrcb)
+        vessel_mask_cr = cv2.compare(Cr, 145, cv2.CMP_GT)
+
+        # HSV マスク: ((H < 10)|(H > 170)) & (S > 70)
+        hsv = cv2.cvtColor(src, cv2.COLOR_BGR2HSV)
+        H, S, _ = cv2.split(hsv)
+        mask_h_low = cv2.compare(H, 10, cv2.CMP_LT)
+        mask_h_high = cv2.compare(H, 170, cv2.CMP_GT)
+        mask_h = cv2.bitwise_or(mask_h_low, mask_h_high)
+        mask_s = cv2.compare(S, 70, cv2.CMP_GT)
+        vessel_mask_hsv = cv2.bitwise_and(mask_h, mask_s)
+
+        # 複合マスク
+        vessel_mask = cv2.bitwise_or(
+            cv2.bitwise_or(vessel_mask_lab, vessel_mask_cr), vessel_mask_hsv
+        )
+
+        # --- 血管領域に追加ブースト ---------------------------------------------
+        # extra = gain * (A_boosted - 128) + 128 = gain*A_boosted + 128*(1-gain)
+        vessel_extra = cv2.addWeighted(
+            A_boosted, vessel_extra_boost, A_boosted, 0, 128.0 * (1.0 - vessel_extra_boost)
+        )
+
+        A_boosted = cv2.bitwise_or(
+            cv2.bitwise_and(vessel_mask, vessel_extra),
+            cv2.bitwise_and(cv2.bitwise_not(vessel_mask), A_boosted),
+        )
+
+        # --- クリップ (0-255) ---------------------------------------------------
+        # UMat 用に saturate_cast を行うには cv2.min/max で簡易クリップ
+        zero_u = cv2.UMat(np.zeros_like(A_boosted.get()))
+        full_u = cv2.UMat(np.full_like(A_boosted.get(), 255))
+        A_boosted = cv2.min(cv2.max(A_boosted, zero_u), full_u)
+        B_boosted = cv2.min(cv2.max(B_boosted, zero_u), full_u)
+
+        # --- 合成 & 逆変換 ------------------------------------------------------
+        lab_boosted = cv2.merge([L_combined, A_boosted, B_boosted])
+        result_umat = cv2.cvtColor(lab_boosted, cv2.COLOR_Lab2BGR)
+
+        return result_umat
+
+    if vascular:
+        image = vascular_enhance_filter_ocl(image)
+
+    if gray:
+        image = gray_filter(image)
+
+    # 必要なら NumPy に変換して返す
+    return image.get() if isinstance(image, cv2.UMat) else image
 
 
-def vascular_enhance_filter(
-    image: np.ndarray,
-    clahe_clip: float = 2.0,
-    a_boost: float = 1.2,
-    b_boost: float = 1.1,
-    l_smooth_ksize: int = 5,
-    multiscale_weight: float = 0.5
-) -> np.ndarray:
-    """
-    マウスの耳などの赤黒い血管構造を自然に目立たせるフィルター。
-    Lab色空間で明度を平滑化＋CLAHE補正し、aチャネル（赤緑）とbチャネル（黄青）を強調。
-    さらにYCrCb・HSV空間のマスクと組み合わせて、赤くて暗い血管領域の検出精度を高める。
-
-    :param image: 入力画像 (numpy.ndarray)
-    :param clahe_clip: CLAHEのコントラスト制限（通常2.0〜4.0）
-    :param a_boost: aチャネル（赤緑成分）の強調係数（>1で赤み増加）
-    :param b_boost: bチャネル（黄青成分）の強調係数（>1で黄み増加）
-    :param l_smooth_ksize: Lチャネルに適用する平滑化（ブラー）カーネルサイズ（奇数）
-    :param multiscale_weight: マルチスケールで加算する強調画像の重み（0.0〜1.0）
-    :return: フィルター処理後のBGR画像 (numpy.ndarray)
-    """
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2Lab)
-    L, A, B = cv2.split(lab)
-
-    # 平滑化 + CLAHE（マルチスケール）
-    L_blur = cv2.GaussianBlur(L, (l_smooth_ksize, l_smooth_ksize), 0)
-    clahe_small = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(8, 8))
-    L_eq = clahe_small.apply(L_blur)
-    clahe_large = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=(16, 16))
-    L_large = clahe_large.apply(L)
-    L_combined = np.clip((1.0 - multiscale_weight) * L_eq + multiscale_weight * L_large, 0, 255).astype(np.uint8)
-
-    # Lab補正
-    A_float = A.astype(np.float32)
-    B_float = B.astype(np.float32)
-    A_boosted = (A_float - 128) * a_boost + 128
-    B_boosted = (B_float - 128) * b_boost + 128
-
-    # 血管マスク（Lab）
-    vessel_mask_lab = (A_boosted > 135) & (L_eq < 120)
-
-    # 血管マスク（YCrCb）
-    ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-    _, Cr, _ = cv2.split(ycrcb)
-    vessel_mask_cr = Cr > 145
-
-    # 血管マスク（HSV）
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    H, S, _ = cv2.split(hsv)
-    vessel_mask_hsv = ((H < 10) | (H > 170)) & (S > 70)
-
-    # 複合血管マスク
-    vessel_mask = vessel_mask_lab | vessel_mask_cr | vessel_mask_hsv
-    A_boosted[vessel_mask] = np.clip((A_boosted[vessel_mask] - 128) * 1.3 + 128, 0, 255)
-
-    # 合成と出力
-    A_result = np.clip(A_boosted, 0, 255).astype(np.uint8)
-    B_result = np.clip(B_boosted, 0, 255).astype(np.uint8)
-    lab_boosted = cv2.merge([L_combined, A_result, B_result])
-    result = cv2.cvtColor(lab_boosted, cv2.COLOR_Lab2BGR)
-
-    return result
 
 
 class RecorderApp(tk.Tk):
@@ -675,12 +731,15 @@ class RecorderApp(tk.Tk):
             if frame is None:
                 break
 
-            if self.filter.get():
-                frame = vascular_enhance_filter(frame)
 
-            if self.gray_mode.get():
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                frame = cv2.merge([gray, gray, gray])
+            frame = filters(frame,vascular=self.filter.get(),gray=self.gray_mode.get())
+
+            # if self.filter.get():
+            #     frame = vascular_enhance_filter_ocl(frame)
+
+            # if self.gray_mode.get():
+            #     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            #     frame = cv2.merge([gray, gray, gray])
 
             canvas_width = self.preview_canvas.winfo_width()
             canvas_height = self.preview_canvas.winfo_height()
@@ -788,12 +847,15 @@ class RecorderApp(tk.Tk):
             if frame is None:
                 break
 
-            if self.filter.get():
-                frame = vascular_enhance_filter(frame)
+            frame = filters(frame,vascular=self.filter.get(),gray=self.gray_mode.get())
 
-            if self.gray_mode.get():
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                frame = cv2.merge([gray, gray, gray])
+
+            # if self.filter.get():
+            #     frame = vascular_enhance_filter_ocl(frame)
+
+            # if self.gray_mode.get():
+            #     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            #     frame = cv2.merge([gray, gray, gray])
 
             self.writer.write(frame)
         self.stop_record()
